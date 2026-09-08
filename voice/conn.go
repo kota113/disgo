@@ -103,10 +103,11 @@ type connImpl struct {
 
 	openedFunc context.CancelFunc
 
-	// Discord completes a voice handshake with one event from each gateway.
-	// Only open after receiving a fresh pair so old state is never reused.
+	// A new handshake needs both events. Once established, the voice state
+	// remains valid across voice server updates until we leave or rejoin.
 	voiceStateReceived  bool
 	voiceServerReceived bool
+	gatewayOpenCancel   func()
 
 	ssrcs   map[uint32]snowflake.ID
 	ssrcsMu sync.Mutex
@@ -191,6 +192,8 @@ func (c *connImpl) HandleVoiceStateUpdate(update botgateway.EventVoiceStateUpdat
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 
+	hadVoiceState := c.voiceStateReceived
+	connectionChanged := false
 	if update.ChannelID == nil {
 		c.state.ChannelID = 0
 		c.resetVoiceEventsLocked()
@@ -202,9 +205,9 @@ func (c *connImpl) HandleVoiceStateUpdate(update botgateway.EventVoiceStateUpdat
 			c.audioReceiver.Close()
 			c.audioReceiver = nil
 		}
-		_ = c.udp.Close()
-		c.gateway.Close()
+		c.closeGatewayLocked()
 	} else {
+		connectionChanged = c.state.ChannelID != *update.ChannelID || c.state.SessionID != update.SessionID
 		c.state.ChannelID = *update.ChannelID
 		c.voiceStateReceived = true
 	}
@@ -212,14 +215,27 @@ func (c *connImpl) HandleVoiceStateUpdate(update botgateway.EventVoiceStateUpdat
 	c.state.SelfMute = update.SelfMute
 	c.state.SelfDeaf = update.SelfDeaf
 
-	c.tryOpenGateway()
+	// A channel or session change can arrive after a server update. Replace an
+	// attempt started with the previous voice state in that case. Mute and deaf
+	// updates do not require a new voice connection so these need to be excluded.
+	if !hadVoiceState || connectionChanged {
+		c.tryOpenGateway()
+	}
 }
 
 func (c *connImpl) HandleVoiceServerUpdate(update botgateway.EventVoiceServerUpdate) {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 
-	if update.GuildID != c.state.GuildID || update.Endpoint == nil {
+	if update.GuildID != c.state.GuildID {
+		return
+	}
+
+	if update.Endpoint == nil {
+		c.state.Token = ""
+		c.state.Endpoint = ""
+		c.voiceServerReceived = false
+		c.closeGatewayLocked()
 		return
 	}
 
@@ -237,14 +253,37 @@ func (c *connImpl) tryOpenGateway() {
 		return
 	}
 	state := c.state
-	c.resetVoiceEventsLocked()
+	c.closeGatewayLocked()
+	ctx, cancel := context.WithTimeout(context.Background(), voiceReconnectTimeout)
+	done := make(chan struct{})
+	// Cancel and drain this Open before replacing the transports.
+	c.gatewayOpenCancel = func() {
+		cancel()
+		<-done
+	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), voiceReconnectTimeout)
 		defer cancel()
-		if err := c.gateway.Open(ctx, state); err != nil {
+		defer close(done)
+		if ctx.Err() != nil {
+			return
+		}
+		if err := c.gateway.Open(ctx, state); err != nil && !errors.Is(err, context.Canceled) {
 			c.config.Logger.Error("error opening voice gateway", slog.Any("err", err))
 		}
 	}()
+}
+
+// closeGatewayLocked cancels any pending gateway open,
+// then closes the gateway and UDP connections.
+func (c *connImpl) closeGatewayLocked() {
+	if c.gatewayOpenCancel != nil {
+		c.gatewayOpenCancel()
+		c.gatewayOpenCancel = nil
+	}
+	c.gateway.Close()
+	if c.udp != nil {
+		_ = c.udp.Close()
+	}
 }
 
 func (c *connImpl) handleMessage(gateway Gateway, op Opcode, sequenceNumber int, data GatewayMessageData) {
@@ -370,8 +409,11 @@ func (c *connImpl) Open(ctx context.Context, channelID snowflake.ID, selfMute bo
 func (c *connImpl) Close(ctx context.Context) {
 	_ = c.voiceStateUpdateFunc(ctx, c.state.GuildID, nil, false, false)
 
-	c.gateway.Close()
-	_ = c.udp.Close()
+	c.stateMu.Lock()
+	c.state.ChannelID = 0
+	c.resetVoiceEventsLocked()
+	c.closeGatewayLocked()
+	c.stateMu.Unlock()
 	_ = c.dave.Close()
 
 	c.removeConnFunc()
