@@ -125,8 +125,11 @@ type gatewayImpl struct {
 	seq   int
 
 	daveSession     godave.Session
-	conn            *websocket.Conn
+	conn            *gatewayConnection
 	connMu          sync.Mutex
+	openMu          sync.Mutex
+	reconnectCtx    context.Context
+	reconnectCancel context.CancelFunc
 	heartbeatCancel context.CancelFunc
 	status          Status
 	statusMu        sync.Mutex
@@ -137,11 +140,30 @@ type gatewayImpl struct {
 	lastNonce             int64
 }
 
+// Each socket retains the server state and lifetime used to open it, including
+// when a reconnect races with a server replacement.
+type gatewayConnection struct {
+	*websocket.Conn
+	reconnectCtx context.Context
+	state        State
+}
+
 func (g *gatewayImpl) SSRC() uint32 {
 	return g.ssrc
 }
 
 func (g *gatewayImpl) Open(ctx context.Context, state State) error {
+	g.connMu.Lock()
+	if g.reconnectCtx == nil || g.reconnectCtx.Err() != nil {
+		g.reconnectCtx, g.reconnectCancel = context.WithCancel(context.Background())
+	}
+	reconnectCtx := g.reconnectCtx
+	g.connMu.Unlock()
+
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(reconnectCtx, cancel)
+	defer stop()
+	defer cancel()
 	return g.doReconnect(ctx, state, 0)
 }
 
@@ -149,12 +171,16 @@ func (g *gatewayImpl) open(ctx context.Context, state State) error {
 	g.config.Logger.Debug("opening voice gateway connection")
 
 	g.connMu.Lock()
+	if err := ctx.Err(); err != nil {
+		g.connMu.Unlock()
+		return err
+	}
 	if g.conn != nil {
 		g.connMu.Unlock()
 		return discord.ErrGatewayAlreadyConnected
 	}
 
-	if state.SessionID != g.state.SessionID {
+	if state.SessionID != g.state.SessionID || state.Token != g.state.Token || state.Endpoint != g.state.Endpoint {
 		g.ssrc = 0
 		g.seq = 0
 	}
@@ -162,6 +188,8 @@ func (g *gatewayImpl) open(ctx context.Context, state State) error {
 	g.statusMu.Lock()
 	g.status = StatusConnecting
 	g.statusMu.Unlock()
+	reconnectCtx := g.reconnectCtx
+	g.connMu.Unlock()
 
 	gatewayURL := fmt.Sprintf("wss://%s?v=%d", state.Endpoint, GatewayVersion)
 	g.lastHeartbeatSent = time.Now()
@@ -181,25 +209,31 @@ func (g *gatewayImpl) open(ctx context.Context, state State) error {
 			slog.String("url", gatewayURL),
 			slog.String("body", string(body)),
 		)
-		g.connMu.Unlock()
 		return err
 	}
 
+	g.connMu.Lock()
+	if err = ctx.Err(); err != nil {
+		g.connMu.Unlock()
+		_ = conn.Close()
+		return err
+	}
 	conn.SetCloseHandler(func(code int, text string) error {
 		return nil
 	})
 
 	g.daveSession.SetChannelID(godave.ChannelID(state.ChannelID))
-	g.conn = conn
-	g.connMu.Unlock()
+	connection := &gatewayConnection{Conn: conn, reconnectCtx: reconnectCtx, state: state}
+	g.conn = connection
 
 	g.statusMu.Lock()
 	g.status = StatusWaitingForHello
 	g.statusMu.Unlock()
+	g.connMu.Unlock()
 
 	var readyOnce sync.Once
-	readyChan := make(chan error)
-	go g.listen(g.conn, func(err error) {
+	readyChan := make(chan error, 1)
+	go g.listen(connection, func(err error) {
 		readyOnce.Do(func() {
 			readyChan <- err
 			close(readyChan)
@@ -208,11 +242,11 @@ func (g *gatewayImpl) open(ctx context.Context, state State) error {
 
 	select {
 	case <-ctx.Done():
-		g.Close()
+		g.closeWithCode(connection, websocket.CloseNormalClosure, "Opening cancelled")
 		return ctx.Err()
 	case err = <-readyChan:
 		if err != nil {
-			g.Close()
+			g.closeWithCode(connection, websocket.CloseServiceRestart, "Opening failed")
 			return fmt.Errorf("failed to open voice gateway connection: %w", err)
 		}
 	}
@@ -225,13 +259,28 @@ func (g *gatewayImpl) Close() {
 }
 
 func (g *gatewayImpl) CloseWithCode(code int, message string) {
+	g.closeWithCode(nil, code, message)
+}
+
+func (g *gatewayImpl) closeWithCode(conn *gatewayConnection, code int, message string) bool {
+	g.connMu.Lock()
+	defer g.connMu.Unlock()
+	if conn != nil && g.conn != conn {
+		return false
+	}
+	if code == websocket.CloseNormalClosure || code == websocket.CloseGoingAway {
+		if g.reconnectCancel != nil {
+			g.reconnectCancel()
+		}
+		// A server can be replaced after the old socket has already closed.
+		g.ssrc = 0
+		g.seq = 0
+	}
 	if g.heartbeatCancel != nil {
 		g.config.Logger.Debug("closing heartbeat goroutine")
 		g.heartbeatCancel()
 	}
 
-	g.connMu.Lock()
-	defer g.connMu.Unlock()
 	if g.conn != nil {
 		g.config.Logger.Debug("closing voice gateway connection", slog.Int("code", code), slog.String("message", message))
 		if err := g.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(code, message)); err != nil && !errors.Is(err, websocket.ErrCloseSent) {
@@ -239,16 +288,11 @@ func (g *gatewayImpl) CloseWithCode(code int, message string) {
 		}
 		_ = g.conn.Close()
 		g.conn = nil
-
-		// clear resume data as we closed gracefully
-		if code == websocket.CloseNormalClosure || code == websocket.CloseGoingAway {
-			g.ssrc = 0
-			g.seq = 0
-		}
 	}
 	g.statusMu.Lock()
 	g.status = StatusDisconnected
 	g.statusMu.Unlock()
+	return true
 }
 
 func (g *gatewayImpl) Status() Status {
@@ -258,9 +302,7 @@ func (g *gatewayImpl) Status() Status {
 }
 
 func (g *gatewayImpl) Send(ctx context.Context, op Opcode, d GatewayMessageData) error {
-	g.statusMu.Lock()
-	defer g.statusMu.Unlock()
-	if g.status != StatusReady {
+	if g.Status() != StatusReady {
 		return discord.ErrShardNotReady
 	}
 
@@ -314,10 +356,15 @@ func (g *gatewayImpl) Latency() time.Duration {
 }
 
 func (g *gatewayImpl) doReconnect(ctx context.Context, state State, maximumAttempts int) error {
+	g.openMu.Lock()
+	defer g.openMu.Unlock()
 	var err error
 	attempt := 0
 	delay := time.Duration(0)
 	for {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if maximumAttempts > 0 && attempt >= maximumAttempts {
 			return fmt.Errorf("failed to reconnect voice gateway after %d attempts: %w", maximumAttempts, err)
 		}
@@ -327,6 +374,7 @@ func (g *gatewayImpl) doReconnect(ctx context.Context, state State, maximumAttem
 			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return ctx.Err()
 			case <-timer.C:
 			}
@@ -336,6 +384,9 @@ func (g *gatewayImpl) doReconnect(ctx context.Context, state State, maximumAttem
 		if err == nil {
 			// Successfully connected, our job here is done
 			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 
 		if errors.Is(err, discord.ErrGatewayAlreadyConnected) {
@@ -366,24 +417,36 @@ func nextReconnectDelay(delay time.Duration) time.Duration {
 	return min(delay*2, maximumConnectDelay)
 }
 
-func (g *gatewayImpl) reconnect() {
-	if err := g.doReconnect(context.Background(), g.state, maximumReconnectAttempts); err != nil {
-		g.config.Logger.Error("failed to reopen voice gateway", slog.Any("err", err))
-
-		g.closeHandlerFunc(g, err)
+func (g *gatewayImpl) reconnect(conn *gatewayConnection, message string) {
+	if !g.closeWithCode(conn, websocket.CloseServiceRestart, message) {
+		return
 	}
+	go func() {
+		if err := g.doReconnect(conn.reconnectCtx, conn.state, maximumReconnectAttempts); err != nil && conn.reconnectCtx.Err() == nil {
+			g.config.Logger.Error("failed to reopen voice gateway", slog.Any("err", err))
+			g.closeHandlerFunc(g, err)
+		}
+	}()
 }
 
-func (g *gatewayImpl) heartbeat() {
+func (g *gatewayImpl) heartbeat(conn *gatewayConnection) {
 	defer g.config.Logger.Debug("exiting voice heartbeat goroutine")
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(conn.reconnectCtx)
+	defer cancel()
+	g.connMu.Lock()
+	if g.conn != conn || ctx.Err() != nil {
+		g.connMu.Unlock()
+		return
+	}
 	g.heartbeatCancel = cancel
+	g.connMu.Unlock()
 
 	g.lastHeartbeatReceived = time.Now()
 
 	// Send heartbeats periodically every `heartbeat_interval`
 	heartbeatTicker := time.NewTicker(g.heartbeatInterval)
+	defer heartbeatTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -393,17 +456,16 @@ func (g *gatewayImpl) heartbeat() {
 			if g.lastHeartbeatSent.After(g.lastHeartbeatReceived) {
 				lastHeartbeatAgo := time.Since(g.lastHeartbeatReceived)
 				g.config.Logger.Warn("ACK of last heartbeat not received, connection went zombie", slog.Duration("last_heartbeat_ago", lastHeartbeatAgo))
-				g.CloseWithCode(websocket.CloseServiceRestart, "heartbeat ACK not received")
-				go g.reconnect()
+				g.reconnect(conn, "heartbeat ACK not received")
 				return
 			}
 
-			g.sendHeartbeat()
+			g.sendHeartbeat(conn)
 		}
 	}
 }
 
-func (g *gatewayImpl) sendHeartbeat() {
+func (g *gatewayImpl) sendHeartbeat(conn *gatewayConnection) {
 	g.config.Logger.Debug("sending heartbeat")
 
 	g.lastNonce = time.Now().UnixMilli()
@@ -418,8 +480,7 @@ func (g *gatewayImpl) sendHeartbeat() {
 			return
 		}
 		g.config.Logger.Error("failed to send heartbeat", slog.Any("err", err))
-		g.CloseWithCode(websocket.CloseServiceRestart, "heartbeat timeout")
-		go g.reconnect()
+		g.reconnect(conn, "heartbeat timeout")
 		return
 	}
 	g.lastHeartbeatSent = time.Now()
@@ -472,7 +533,7 @@ func (g *gatewayImpl) resume() error {
 	return nil
 }
 
-func (g *gatewayImpl) listen(conn *websocket.Conn, ready func(error)) {
+func (g *gatewayImpl) listen(conn *gatewayConnection, ready func(error)) {
 	defer g.config.Logger.Debug("exiting listen goroutine")
 
 	// Ensure that we never leave this function without calling ready
@@ -480,14 +541,15 @@ func (g *gatewayImpl) listen(conn *websocket.Conn, ready func(error)) {
 
 	for {
 		mt, reader, err := conn.NextReader()
+		if conn.reconnectCtx.Err() != nil {
+			ready(conn.reconnectCtx.Err())
+			return
+		}
 		if err != nil {
-			g.statusMu.Lock()
-			if g.status != StatusReady {
-				g.statusMu.Unlock()
+			if g.Status() != StatusReady {
 				ready(err)
 				return
 			}
-			g.statusMu.Unlock()
 			g.connMu.Lock()
 			sameConn := g.conn == conn
 			g.connMu.Unlock()
@@ -525,13 +587,18 @@ func (g *gatewayImpl) listen(conn *websocket.Conn, ready func(error)) {
 				go g.config.Observer(err)
 			}
 
-			// make sure the connection is properly closed
-			g.CloseWithCode(websocket.CloseServiceRestart, "reconnecting")
 			if reconnect {
-				go g.reconnect()
+				g.reconnect(conn, "reconnecting")
 				return
 			}
-			go g.closeHandlerFunc(g, err)
+			if !g.closeWithCode(conn, websocket.CloseServiceRestart, "disconnected") {
+				return
+			}
+			go func() {
+				if conn.reconnectCtx.Err() == nil {
+					g.closeHandlerFunc(g, err)
+				}
+			}()
 
 			return
 		}
@@ -550,7 +617,7 @@ func (g *gatewayImpl) listen(conn *websocket.Conn, ready func(error)) {
 		case OpcodeHello:
 			d := message.D.(GatewayMessageDataHello)
 			g.heartbeatInterval = time.Duration(d.HeartbeatInterval) * time.Millisecond
-			go g.heartbeat()
+			go g.heartbeat(conn)
 
 			if g.ssrc == 0 || g.seq == 0 {
 				err = g.identify()
@@ -580,8 +647,7 @@ func (g *gatewayImpl) listen(conn *websocket.Conn, ready func(error)) {
 			d := message.D.(GatewayMessageDataHeartbeatACK)
 			if d.T != g.lastNonce {
 				g.config.Logger.Error("received heartbeat ack with nonce", slog.Int64("nonce", d.T), slog.Int64("last_nonce", g.lastNonce))
-				g.CloseWithCode(websocket.CloseServiceRestart, "heartbeat ACK nonce mismatch")
-				go g.reconnect()
+				g.reconnect(conn, "heartbeat ACK nonce mismatch")
 				return
 			}
 			g.lastHeartbeatReceived = time.Now()
