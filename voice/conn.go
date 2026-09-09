@@ -108,6 +108,7 @@ type connImpl struct {
 	voiceStateReceived  bool
 	voiceServerReceived bool
 	gatewayOpenCancel   func()
+	gatewayOpenAttempt  uint64
 
 	ssrcs   map[uint32]snowflake.ID
 	ssrcsMu sync.Mutex
@@ -192,6 +193,20 @@ func (c *connImpl) HandleVoiceStateUpdate(update botgateway.EventVoiceStateUpdat
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 
+	previousChannelID := c.state.ChannelID
+	previousSessionID := c.state.SessionID
+	c.config.Logger.Info("voice diagnostic: handling bot voice state update",
+		slog.Int64("guild_id", int64(update.GuildID)),
+		slog.Int64("user_id", int64(update.UserID)),
+		slog.Bool("has_channel", update.ChannelID != nil),
+		slog.Int64("channel_id", voiceChannelID(update.ChannelID)),
+		slog.Int64("previous_channel_id", int64(previousChannelID)),
+		slog.Bool("session_available", update.SessionID != ""),
+		slog.Bool("session_changed", previousSessionID != update.SessionID),
+		slog.Bool("voice_state_received", c.voiceStateReceived),
+		slog.Bool("voice_server_received", c.voiceServerReceived),
+	)
+
 	hadVoiceState := c.voiceStateReceived
 	connectionChanged := false
 	if update.ChannelID == nil {
@@ -219,7 +234,17 @@ func (c *connImpl) HandleVoiceStateUpdate(update botgateway.EventVoiceStateUpdat
 	// attempt started with the previous voice state in that case. Mute and deaf
 	// updates do not require a new voice connection so these need to be excluded.
 	if !hadVoiceState || connectionChanged {
+		c.config.Logger.Info("voice diagnostic: voice state requires gateway evaluation",
+			slog.Int64("guild_id", int64(update.GuildID)),
+			slog.Bool("had_voice_state", hadVoiceState),
+			slog.Bool("connection_changed", connectionChanged),
+		)
 		c.tryOpenGateway()
+	} else {
+		c.config.Logger.Info("voice diagnostic: voice state did not change connection",
+			slog.Int64("guild_id", int64(update.GuildID)),
+			slog.Int64("channel_id", int64(c.state.ChannelID)),
+		)
 	}
 }
 
@@ -230,6 +255,18 @@ func (c *connImpl) HandleVoiceServerUpdate(update botgateway.EventVoiceServerUpd
 	if update.GuildID != c.state.GuildID {
 		return
 	}
+
+	c.config.Logger.Info("voice diagnostic: handling voice server update",
+		slog.Int64("guild_id", int64(update.GuildID)),
+		slog.Bool("endpoint_available", update.Endpoint != nil),
+		slog.Bool("endpoint_changed", update.Endpoint != nil && c.state.Endpoint != *update.Endpoint),
+		slog.Bool("token_available", update.Token != ""),
+		slog.Bool("token_changed", c.state.Token != update.Token),
+		slog.Int64("channel_id", int64(c.state.ChannelID)),
+		slog.Bool("session_available", c.state.SessionID != ""),
+		slog.Bool("voice_state_received", c.voiceStateReceived),
+		slog.Bool("voice_server_received", c.voiceServerReceived),
+	)
 
 	if update.Endpoint == nil {
 		c.state.Token = ""
@@ -246,13 +283,36 @@ func (c *connImpl) HandleVoiceServerUpdate(update botgateway.EventVoiceServerUpd
 }
 
 func (c *connImpl) tryOpenGateway() {
+	c.config.Logger.Info("voice diagnostic: evaluating gateway open",
+		slog.Int64("guild_id", int64(c.state.GuildID)),
+		slog.Int64("channel_id", int64(c.state.ChannelID)),
+		slog.Bool("session_available", c.state.SessionID != ""),
+		slog.Bool("token_available", c.state.Token != ""),
+		slog.Bool("endpoint_available", c.state.Endpoint != ""),
+		slog.Bool("voice_state_received", c.voiceStateReceived),
+		slog.Bool("voice_server_received", c.voiceServerReceived),
+	)
 	if c.state.SessionID == "" || c.state.Token == "" || c.state.Endpoint == "" || c.state.ChannelID == 0 {
+		c.config.Logger.Info("voice diagnostic: gateway open deferred due to incomplete state",
+			slog.Int64("guild_id", int64(c.state.GuildID)),
+		)
 		return
 	}
 	if !c.voiceStateReceived || !c.voiceServerReceived {
+		c.config.Logger.Info("voice diagnostic: gateway open deferred while awaiting events",
+			slog.Int64("guild_id", int64(c.state.GuildID)),
+		)
 		return
 	}
 	state := c.state
+	c.gatewayOpenAttempt++
+	attempt := c.gatewayOpenAttempt
+	c.config.Logger.Info("voice diagnostic: replacing transports for gateway open",
+		slog.Int64("guild_id", int64(state.GuildID)),
+		slog.Int64("channel_id", int64(state.ChannelID)),
+		slog.Uint64("attempt", attempt),
+		slog.String("endpoint", state.Endpoint),
+	)
 	c.closeGatewayLocked()
 	ctx, cancel := context.WithTimeout(context.Background(), voiceReconnectTimeout)
 	done := make(chan struct{})
@@ -265,10 +325,22 @@ func (c *connImpl) tryOpenGateway() {
 		defer cancel()
 		defer close(done)
 		if ctx.Err() != nil {
+			c.config.Logger.Info("voice diagnostic: gateway open cancelled before start",
+				slog.Int64("guild_id", int64(state.GuildID)),
+				slog.Uint64("attempt", attempt),
+			)
 			return
 		}
-		if err := c.gateway.Open(ctx, state); err != nil && !errors.Is(err, context.Canceled) {
-			c.config.Logger.Error("error opening voice gateway", slog.Any("err", err))
+		err := c.gateway.Open(ctx, state)
+		c.config.Logger.Info("voice diagnostic: gateway open finished",
+			slog.Int64("guild_id", int64(state.GuildID)),
+			slog.Int64("channel_id", int64(state.ChannelID)),
+			slog.Uint64("attempt", attempt),
+			slog.Any("err", err),
+			slog.Bool("context_cancelled", ctx.Err() != nil),
+		)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			c.config.Logger.Error("error opening voice gateway", slog.Any("err", err), slog.Uint64("attempt", attempt))
 		}
 	}()
 }
@@ -276,6 +348,11 @@ func (c *connImpl) tryOpenGateway() {
 // closeGatewayLocked cancels any pending gateway open,
 // then closes the gateway and UDP connections.
 func (c *connImpl) closeGatewayLocked() {
+	c.config.Logger.Info("voice diagnostic: closing voice transports",
+		slog.Int64("guild_id", int64(c.state.GuildID)),
+		slog.Int64("channel_id", int64(c.state.ChannelID)),
+		slog.Bool("pending_open", c.gatewayOpenCancel != nil),
+	)
 	if c.gatewayOpenCancel != nil {
 		c.gatewayOpenCancel()
 		c.gatewayOpenCancel = nil
@@ -352,6 +429,17 @@ func (c *connImpl) handleGatewayClose(_ Gateway, err error) {
 		closeCode := GatewayCloseEventCodeByCode(closeError.Code)
 		newConnection = closeCode.NewConnection
 	}
+	c.config.Logger.Info("voice diagnostic: gateway close callback",
+		slog.Int64("guild_id", int64(c.state.GuildID)),
+		slog.Any("err", err),
+		slog.Bool("new_connection", newConnection),
+		slog.Int("close_code", func() int {
+			if closeError == nil {
+				return 0
+			}
+			return closeError.Code
+		}()),
+	)
 
 	if newConnection {
 		c.stateMu.Lock()
@@ -383,7 +471,10 @@ func (c *connImpl) handleGatewayClose(_ Gateway, err error) {
 }
 
 func (c *connImpl) Open(ctx context.Context, channelID snowflake.ID, selfMute bool, selfDeaf bool) error {
-	c.config.Logger.Debug("opening voice conn")
+	c.config.Logger.Info("voice diagnostic: voice conn open requested",
+		slog.Int64("guild_id", int64(c.state.GuildID)),
+		slog.Int64("channel_id", int64(channelID)),
+	)
 
 	openedCtx, cancel := context.WithCancel(context.Background())
 	c.openedFunc = cancel
@@ -400,13 +491,26 @@ func (c *connImpl) Open(ctx context.Context, channelID snowflake.ID, selfMute bo
 
 	select {
 	case <-openedCtx.Done():
+		c.config.Logger.Info("voice diagnostic: voice conn open completed",
+			slog.Int64("guild_id", int64(guildID)),
+			slog.Int64("channel_id", int64(channelID)),
+		)
 		return nil
 	case <-ctx.Done():
+		c.config.Logger.Info("voice diagnostic: voice conn open context ended",
+			slog.Int64("guild_id", int64(guildID)),
+			slog.Int64("channel_id", int64(channelID)),
+			slog.Any("err", ctx.Err()),
+		)
 		return ctx.Err()
 	}
 }
 
 func (c *connImpl) Close(ctx context.Context) {
+	c.config.Logger.Info("voice diagnostic: voice conn close requested",
+		slog.Int64("guild_id", int64(c.state.GuildID)),
+		slog.Int64("channel_id", int64(c.state.ChannelID)),
+	)
 	_ = c.voiceStateUpdateFunc(ctx, c.state.GuildID, nil, false, false)
 
 	c.stateMu.Lock()
@@ -422,4 +526,11 @@ func (c *connImpl) Close(ctx context.Context) {
 func (c *connImpl) resetVoiceEventsLocked() {
 	c.voiceStateReceived = false
 	c.voiceServerReceived = false
+}
+
+func voiceChannelID(channelID *snowflake.ID) int64 {
+	if channelID == nil {
+		return 0
+	}
+	return int64(*channelID)
 }

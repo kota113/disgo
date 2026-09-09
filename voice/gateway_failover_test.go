@@ -54,7 +54,7 @@ func TestGatewayCloseCancelsDialAndReconnect(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("Open did not stop after Close")
 	}
-	if err := gateway.doReconnect(gateway.reconnectCtx, State{Endpoint: "stale.discord.media"}, maximumReconnectAttempts); !errors.Is(err, context.Canceled) {
+	if err := gateway.doReconnect(gateway.activeReconnectCtx, State{Endpoint: "stale.discord.media"}, maximumReconnectAttempts); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected cancelled reconnect, got %v", err)
 	}
 	select {

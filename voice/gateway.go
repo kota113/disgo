@@ -124,15 +124,15 @@ type gatewayImpl struct {
 	state State
 	seq   int
 
-	daveSession     godave.Session
-	conn            *gatewayConnection
-	connMu          sync.Mutex
-	openMu          sync.Mutex
-	reconnectCtx    context.Context
-	reconnectCancel context.CancelFunc
-	heartbeatCancel context.CancelFunc
-	status          Status
-	statusMu        sync.Mutex
+	daveSession           godave.Session
+	conn                  *gatewayConnection
+	connMu                sync.Mutex
+	openMu                sync.Mutex
+	activeReconnectCtx    context.Context
+	activeReconnectCancel context.CancelFunc
+	heartbeatCancel       context.CancelFunc
+	status                Status
+	statusMu              sync.Mutex
 
 	heartbeatInterval     time.Duration
 	lastHeartbeatSent     time.Time
@@ -154,10 +154,19 @@ func (g *gatewayImpl) SSRC() uint32 {
 
 func (g *gatewayImpl) Open(ctx context.Context, state State) error {
 	g.connMu.Lock()
-	if g.reconnectCtx == nil || g.reconnectCtx.Err() != nil {
-		g.reconnectCtx, g.reconnectCancel = context.WithCancel(context.Background())
+	reusedReconnectContext := g.activeReconnectCtx != nil && g.activeReconnectCtx.Err() == nil
+	if g.activeReconnectCtx == nil || g.activeReconnectCtx.Err() != nil {
+		g.activeReconnectCtx, g.activeReconnectCancel = context.WithCancel(context.Background())
 	}
-	reconnectCtx := g.reconnectCtx
+	reconnectCtx := g.activeReconnectCtx
+	g.config.Logger.Info("voice diagnostic: gateway open entered",
+		slog.Int64("guild_id", int64(state.GuildID)),
+		slog.Int64("channel_id", int64(state.ChannelID)),
+		slog.String("endpoint", state.Endpoint),
+		slog.Bool("reused_reconnect_context", reusedReconnectContext),
+		slog.Bool("socket_present", g.conn != nil),
+		slog.Int("status", int(g.Status())),
+	)
 	g.connMu.Unlock()
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -168,7 +177,11 @@ func (g *gatewayImpl) Open(ctx context.Context, state State) error {
 }
 
 func (g *gatewayImpl) open(ctx context.Context, state State) error {
-	g.config.Logger.Debug("opening voice gateway connection")
+	g.config.Logger.Info("voice diagnostic: dialing voice gateway",
+		slog.Int64("guild_id", int64(state.GuildID)),
+		slog.Int64("channel_id", int64(state.ChannelID)),
+		slog.String("endpoint", state.Endpoint),
+	)
 
 	g.connMu.Lock()
 	if err := ctx.Err(); err != nil {
@@ -188,7 +201,7 @@ func (g *gatewayImpl) open(ctx context.Context, state State) error {
 	g.statusMu.Lock()
 	g.status = StatusConnecting
 	g.statusMu.Unlock()
-	reconnectCtx := g.reconnectCtx
+	reconnectCtx := g.activeReconnectCtx
 	g.connMu.Unlock()
 
 	gatewayURL := fmt.Sprintf("wss://%s?v=%d", state.Endpoint, GatewayVersion)
@@ -225,6 +238,11 @@ func (g *gatewayImpl) open(ctx context.Context, state State) error {
 	g.daveSession.SetChannelID(godave.ChannelID(state.ChannelID))
 	connection := &gatewayConnection{Conn: conn, reconnectCtx: reconnectCtx, state: state}
 	g.conn = connection
+	g.config.Logger.Info("voice diagnostic: installed voice gateway socket",
+		slog.Int64("guild_id", int64(state.GuildID)),
+		slog.Int64("channel_id", int64(state.ChannelID)),
+		slog.String("endpoint", state.Endpoint),
+	)
 
 	g.statusMu.Lock()
 	g.status = StatusWaitingForHello
@@ -265,12 +283,27 @@ func (g *gatewayImpl) CloseWithCode(code int, message string) {
 func (g *gatewayImpl) closeWithCode(conn *gatewayConnection, code int, message string) bool {
 	g.connMu.Lock()
 	defer g.connMu.Unlock()
+	g.config.Logger.Info("voice diagnostic: gateway close requested",
+		slog.Int64("guild_id", int64(g.state.GuildID)),
+		slog.Int64("channel_id", int64(g.state.ChannelID)),
+		slog.Int("code", code),
+		slog.String("message", message),
+		slog.Bool("targeted_close", conn != nil),
+		slog.Bool("target_is_current", conn == nil || g.conn == conn),
+		slog.Bool("socket_present", g.conn != nil),
+		slog.Int("status", int(g.Status())),
+	)
 	if conn != nil && g.conn != conn {
+		g.config.Logger.Info("voice diagnostic: ignored close for superseded gateway socket",
+			slog.Int64("guild_id", int64(g.state.GuildID)),
+			slog.Int("code", code),
+			slog.String("message", message),
+		)
 		return false
 	}
 	if code == websocket.CloseNormalClosure || code == websocket.CloseGoingAway {
-		if g.reconnectCancel != nil {
-			g.reconnectCancel()
+		if g.activeReconnectCancel != nil {
+			g.activeReconnectCancel()
 		}
 		// A server can be replaced after the old socket has already closed.
 		g.ssrc = 0
@@ -369,6 +402,14 @@ func (g *gatewayImpl) doReconnect(ctx context.Context, state State, maximumAttem
 			return fmt.Errorf("failed to reconnect voice gateway after %d attempts: %w", maximumAttempts, err)
 		}
 		attempt++
+		g.config.Logger.Info("voice diagnostic: gateway connection attempt",
+			slog.Int64("guild_id", int64(state.GuildID)),
+			slog.Int64("channel_id", int64(state.ChannelID)),
+			slog.String("endpoint", state.Endpoint),
+			slog.Int("attempt", attempt),
+			slog.Int("maximum_attempts", maximumAttempts),
+			slog.Duration("delay", delay),
+		)
 
 		if delay > 0 {
 			timer := time.NewTimer(delay)
@@ -418,6 +459,12 @@ func nextReconnectDelay(delay time.Duration) time.Duration {
 }
 
 func (g *gatewayImpl) reconnect(conn *gatewayConnection, message string) {
+	g.config.Logger.Info("voice diagnostic: gateway reconnect requested",
+		slog.Int64("guild_id", int64(conn.state.GuildID)),
+		slog.Int64("channel_id", int64(conn.state.ChannelID)),
+		slog.String("endpoint", conn.state.Endpoint),
+		slog.String("message", message),
+	)
 	if !g.closeWithCode(conn, websocket.CloseServiceRestart, message) {
 		return
 	}
@@ -556,6 +603,11 @@ func (g *gatewayImpl) listen(conn *gatewayConnection, ready func(error)) {
 
 			// if sameConn is false, it means the connection has been closed by the user, and we can just exit
 			if !sameConn {
+				g.config.Logger.Info("voice diagnostic: listener exited for superseded gateway socket",
+					slog.Int64("guild_id", int64(conn.state.GuildID)),
+					slog.Int64("channel_id", int64(conn.state.ChannelID)),
+					slog.Any("err", err),
+				)
 				return
 			}
 
@@ -588,6 +640,11 @@ func (g *gatewayImpl) listen(conn *gatewayConnection, ready func(error)) {
 			}
 
 			if reconnect {
+				g.config.Logger.Info("voice diagnostic: listener selected reconnect",
+					slog.Int64("guild_id", int64(conn.state.GuildID)),
+					slog.Int64("channel_id", int64(conn.state.ChannelID)),
+					slog.Any("err", err),
+				)
 				g.reconnect(conn, "reconnecting")
 				return
 			}
