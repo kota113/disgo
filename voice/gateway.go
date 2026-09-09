@@ -302,14 +302,32 @@ func (g *gatewayImpl) Status() Status {
 }
 
 func (g *gatewayImpl) Send(ctx context.Context, op Opcode, d GatewayMessageData) error {
-	if g.Status() != StatusReady {
+	g.statusMu.Lock()
+	ready := g.status == StatusReady
+	g.statusMu.Unlock()
+	if !ready {
 		return discord.ErrShardNotReady
 	}
 
-	return g.sendInternal(ctx, op, d)
+	g.connMu.Lock()
+	defer g.connMu.Unlock()
+
+	g.statusMu.Lock()
+	defer g.statusMu.Unlock()
+	if g.status != StatusReady {
+		return discord.ErrShardNotReady
+	}
+
+	return g.sendInternalLocked(ctx, op, d)
 }
 
 func (g *gatewayImpl) sendInternal(ctx context.Context, op Opcode, d GatewayMessageData) error {
+	g.connMu.Lock()
+	defer g.connMu.Unlock()
+	return g.sendInternalLocked(ctx, op, d)
+}
+
+func (g *gatewayImpl) sendInternalLocked(ctx context.Context, op Opcode, d GatewayMessageData) error {
 	if op.IsBinary() {
 		// We are basically writing the following struct here:
 		// {
@@ -325,7 +343,7 @@ func (g *gatewayImpl) sendInternal(ctx context.Context, op Opcode, d GatewayMess
 			return err
 		}
 
-		return g.send(ctx, websocket.BinaryMessage, buf.Bytes())
+		return g.sendLocked(ctx, websocket.BinaryMessage, buf.Bytes())
 	}
 
 	data, err := json.Marshal(GatewayMessage{
@@ -335,12 +353,10 @@ func (g *gatewayImpl) sendInternal(ctx context.Context, op Opcode, d GatewayMess
 	if err != nil {
 		return err
 	}
-	return g.send(ctx, websocket.TextMessage, data)
+	return g.sendLocked(ctx, websocket.TextMessage, data)
 }
 
-func (g *gatewayImpl) send(ctx context.Context, messageType int, data []byte) error {
-	g.connMu.Lock()
-	defer g.connMu.Unlock()
+func (g *gatewayImpl) sendLocked(ctx context.Context, messageType int, data []byte) error {
 	if g.conn == nil {
 		return ErrGatewayNotConnected
 	}
